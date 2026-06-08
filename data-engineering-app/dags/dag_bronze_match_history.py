@@ -12,13 +12,14 @@ load_dotenv()
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from datetime import datetime
 
 sys.path.append('/opt/airflow/source')
 
 from utils.get_token import get_battle_net_access_token
 from utils.get_match_history import fetch_match_history_raw
+from utils.bronze_schemas import validate_match_history_response
+from utils.silver_loader import get_checkpoint_game_counts, upsert_match_history_checkpoint
 
 CLIENT_ID = os.getenv('BLIZZARD_CLIENT_ID', 'COLOQUE_SEU_CLIENT_ID_AQUI')
 CLIENT_SECRET = os.getenv('BLIZZARD_CLIENT_SECRET', 'COLOQUE_SEU_SECRET_AQUI')
@@ -66,14 +67,20 @@ def _get_token(**context):
 
 def _load_players(**context):
     """
-    Camada Bronze - Lê os arquivos legacy_ladders_raw_{league_id}_{date}.json do disco,
-    gerados pelo dag_bronze_structure (@daily). Extrai e deduplica a lista de jogadores
-    de todas as ligas (Platinum, Diamond, Master, Grandmaster).
+    Camada Bronze - Lê os arquivos legacy_ladders_raw_{league_id}_{date}.json,
+    compara o total de jogos atual (wins + losses) com silver.match_history_checkpoint
+    e retorna apenas os jogadores que tiveram novos jogos desde a última execução.
 
-    Depende de dag_bronze_structure ter rodado ao menos uma vez.
-    Retorna lista de {id, realm, region} via XCom.
+    Primeira execução: checkpoint vazio → full load de todos os jogadores.
+    Execuções seguintes: carrega apenas quem mudou → reduz requisições drasticamente.
+
+    Jogadores com 0 jogos são ignorados (sem match history para buscar).
+    Salva players_list_{exec_date}.json no disco e retorna o caminho via XCom.
     """
-    # Usa dict para deduplicar jogadores que aparecem em múltiplas ligas
+    exec_date = context['logical_date'].strftime('%Y-%m-%d_%H%M')
+    os.makedirs(BRONZE_PATH, exist_ok=True)
+
+    # character_id → {id, realm, region, current_games}
     unique_players = {}
 
     for league_id in LEAGUE_IDS:
@@ -93,16 +100,71 @@ def _load_players(**context):
             for member in members:
                 char = member.get('character', {})
                 if char and char.get('id') and char.get('realm') and char.get('region'):
-                    key = (char['id'], char['realm'], char['region'])
-                    unique_players[key] = {
-                        'id': char['id'],
-                        'realm': char['realm'],
-                        'region': char['region'],
-                    }
+                    char_id = char['id']
+                    current_games = (member.get('wins') or 0) + (member.get('losses') or 0)
 
-    player_list = list(unique_players.values())
-    print(f"Total de jogadores únicos para coleta de match history: {len(player_list)}")
-    return player_list
+                    if char_id not in unique_players:
+                        unique_players[char_id] = {
+                            'id': char_id,
+                            'realm': char['realm'],
+                            'region': char['region'],
+                            'current_games': current_games,
+                        }
+                    else:
+                        # Jogador em múltiplas ligas: mantém o maior contador visto
+                        unique_players[char_id]['current_games'] = max(
+                            unique_players[char_id]['current_games'], current_games
+                        )
+
+    checkpoint = get_checkpoint_game_counts()
+
+    changed_players = [
+        p for p in unique_players.values()
+        if p['current_games'] > 0
+        and p['current_games'] != checkpoint.get(p['id'], -1)
+    ]
+
+    total = len(unique_players)
+    changed = len(changed_players)
+    skipped = total - changed
+    first_run = len(checkpoint) == 0
+    print(
+        f"{'[PRIMEIRA EXECUÇÃO — full load] ' if first_run else ''}"
+        f"Jogadores totais: {total} | "
+        f"Com novos jogos: {changed} | "
+        f"Sem alteração (pulados): {skipped}"
+    )
+
+    players_file = f"{BRONZE_PATH}/players_list_{exec_date}.json"
+    with open(players_file, 'w', encoding='utf-8') as f:
+        json.dump(changed_players, f)
+    print(f"Lista salva em: {players_file}")
+
+    return players_file
+
+
+def _update_checkpoint(**context):
+    """
+    Atualiza silver.match_history_checkpoint com o total de jogos de cada
+    jogador que teve match history coletado nesta execução.
+    Executada somente após _extract_matches concluir com sucesso — garante que
+    o checkpoint só avança quando a extração de fato aconteceu.
+    """
+    players_file = context['ti'].xcom_pull(task_ids='load_players')
+    if not players_file:
+        print("Nenhum arquivo de jogadores encontrado, pulando atualização do checkpoint.")
+        return
+
+    with open(players_file, 'r', encoding='utf-8') as f:
+        players = json.load(f)
+
+    if not players:
+        print("Nenhum jogador para atualizar no checkpoint.")
+        return
+
+    player_counts = {p['id']: p['current_games'] for p in players}
+    upsert_match_history_checkpoint(player_counts)
+    print(f"Checkpoint atualizado para {len(player_counts)} jogadores.")
 
 
 def _extract_matches(**context):
@@ -115,14 +177,21 @@ def _extract_matches(**context):
     - Saída: matches_all_history_{exec_date}.json
     """
     token = context['ti'].xcom_pull(task_ids='get_token')
-    players = context['ti'].xcom_pull(task_ids='load_players')
+    players_file = context['ti'].xcom_pull(task_ids='load_players')
     exec_date = context['logical_date'].strftime('%Y-%m-%d_%H%M')
     out_file = f"{BRONZE_PATH}/matches_all_history_{exec_date}.json"
 
     os.makedirs(BRONZE_PATH, exist_ok=True)
 
+    if not players_file:
+        print("Nenhum arquivo de jogadores encontrado. Verifique se dag_bronze_structure já rodou.")
+        return
+
+    with open(players_file, 'r', encoding='utf-8') as f:
+        players = json.load(f)
+
     if not players:
-        print("Nenhum jogador encontrado. Verifique se dag_bronze_structure já rodou.")
+        print("Nenhum jogador com novos jogos detectado. Execução encerrada sem chamadas à API.")
         return
 
     print(f"Iniciando extração de match history para {len(players)} jogadores...")
@@ -137,6 +206,7 @@ def _extract_matches(**context):
                 token, player['region'], player['realm'], player['id']
             )
             if data and data.get('matches'):
+                validate_match_history_response(data, player['id'])
                 return data
         except Exception as e:
             print(f"Erro ao buscar matches do jogador {player['id']}: {e}")
@@ -193,10 +263,9 @@ with DAG(
         python_callable=_extract_matches,
     )
 
-    trigger_silver_match_history = TriggerDagRunOperator(
-        task_id='trigger_silver_match_history',
-        trigger_dag_id='silver_match_history',
-        wait_for_completion=False,
+    update_checkpoint = PythonOperator(
+        task_id='update_checkpoint',
+        python_callable=_update_checkpoint,
     )
 
-    get_token >> load_players >> extract_matches >> trigger_silver_match_history
+    get_token >> load_players >> extract_matches >> update_checkpoint

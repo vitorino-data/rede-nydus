@@ -17,6 +17,7 @@ sys.path.append('/opt/airflow/source')
 
 from utils.get_token import get_battle_net_access_token
 from utils.get_ladder import fetch_ladder_modern_raw
+from utils.bronze_schemas import validate_modern_ladder_response
 
 # Credenciais vindas de Váriaveis de Ambiente (Para não expor no GitHub)
 CLIENT_ID = os.getenv('BLIZZARD_CLIENT_ID', 'COLOQUE_SEU_CLIENT_ID_AQUI')
@@ -82,6 +83,7 @@ def _extract_modern_ladders(**context):
             time.sleep(0.5)
             data = fetch_ladder_modern_raw(acesso=token, ladder_id=ladder_id)
             if data:
+                validate_modern_ladder_response(data, ladder_id)
                 return {"ladder_id": ladder_id, "data": data}
         except Exception as e:
             print(f"Erro no ladder modern {ladder_id}: {e}")

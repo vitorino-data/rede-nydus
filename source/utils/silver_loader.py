@@ -8,7 +8,7 @@ import psycopg2.extras
 def _get_connection():
     conn_str = os.getenv(
         'SILVER_DB_CONN',
-        'postgresql://user:password@postgres:5432/mydatabase',
+        'postgresql://user:password@postgres_data:5432/mydatabase',
     )
     return psycopg2.connect(conn_str)
 
@@ -123,6 +123,17 @@ CREATE TABLE IF NOT EXISTS silver.processed_files (
 );
 """
 
+_DDL_MATCH_HISTORY_CHECKPOINT = """
+CREATE SCHEMA IF NOT EXISTS silver;
+
+CREATE TABLE IF NOT EXISTS silver.match_history_checkpoint (
+    character_id  INTEGER   NOT NULL,
+    total_games   INTEGER   NOT NULL,
+    updated_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (character_id)
+);
+"""
+
 
 def ensure_silver_tables(cursor) -> None:
     """Cria o schema e as tabelas silver se ainda não existirem (idempotente)."""
@@ -131,6 +142,7 @@ def ensure_silver_tables(cursor) -> None:
     cursor.execute(_DDL_LEGACY_LADDER_MEMBERS)
     cursor.execute(_DDL_MATCH_HISTORY)
     cursor.execute(_DDL_PROCESSED_FILES)
+    cursor.execute(_DDL_MATCH_HISTORY_CHECKPOINT)
 
 
 def is_file_processed(filename: str) -> bool:
@@ -257,6 +269,42 @@ def load_legacy_ladder_members(df: pd.DataFrame) -> int:
             inserted = cur.rowcount
     print(f"[legacy_ladder_members] {inserted} linhas inseridas / {len(rows)} processadas.")
     return inserted
+
+
+def get_checkpoint_game_counts() -> dict:
+    """
+    Retorna {character_id: total_games} para todos os jogadores registrados
+    em silver.match_history_checkpoint.
+    Retorna dict vazio na primeira execução (sem checkpoint ainda).
+    """
+    with _get_connection() as conn:
+        with conn.cursor() as cur:
+            ensure_silver_tables(cur)
+            cur.execute("SELECT character_id, total_games FROM silver.match_history_checkpoint")
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def upsert_match_history_checkpoint(player_counts: dict) -> None:
+    """
+    Atualiza total_games no checkpoint para os jogadores fornecidos.
+    player_counts: {character_id: total_games}
+    """
+    if not player_counts:
+        return
+
+    rows = list(player_counts.items())
+    sql = """
+        INSERT INTO silver.match_history_checkpoint (character_id, total_games)
+        VALUES %s
+        ON CONFLICT (character_id) DO UPDATE SET
+            total_games = EXCLUDED.total_games,
+            updated_at  = NOW()
+    """
+    with _get_connection() as conn:
+        with conn.cursor() as cur:
+            ensure_silver_tables(cur)
+            psycopg2.extras.execute_values(cur, sql, rows)
+    print(f"[match_history_checkpoint] {len(rows)} registros atualizados.")
 
 
 def load_match_history(df: pd.DataFrame) -> int:

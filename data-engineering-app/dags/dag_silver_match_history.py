@@ -18,15 +18,15 @@ def _process_match_history_to_silver(**context):
     """
     Encontra o arquivo matches_all_history_*.json mais recente no bronze.
     Se o arquivo já foi processado (silver.processed_files), encerra sem reprocessar.
-    Caso contrário, transforma em DataFrame flat (uma linha por partida) e
-    retorna o caminho do arquivo via XCom para a task de carga.
+    Retorna o caminho do arquivo via XCom para a task de carga (nunca o DataFrame).
     """
     files = sorted(glob.glob(f"{BRONZE_PATH}/matches_all_history_*.json"))
     if not files:
-        raise FileNotFoundError(
+        print(
             f"Nenhum arquivo matches_all_history_*.json encontrado em {BRONZE_PATH}. "
-            "Execute a dag_bronze_match_history primeiro."
+            "Aguardando próxima execução do dag_bronze_match_history."
         )
+        return None
 
     latest_file = files[-1]
     filename = os.path.basename(latest_file)
@@ -35,10 +35,7 @@ def _process_match_history_to_silver(**context):
         print(f"Arquivo já processado anteriormente, pulando: {filename}")
         return None
 
-    print(f"Processando: {latest_file}")
-    df = transform_match_history_to_silver(latest_file)
-    print(f"DataFrame gerado: {df.shape[0]} linhas, {df.shape[1]} colunas.")
-
+    print(f"Novo arquivo detectado para processamento: {filename}")
     return latest_file
 
 
@@ -65,12 +62,13 @@ default_args = {
     'retries': 1,
 }
 
-# Sem schedule_interval — este DAG é acionado exclusivamente via
-# TriggerDagRunOperator pela dag_bronze_match_history ao concluir com sucesso.
+# Roda a cada 30 minutos e verifica se há arquivo novo não processado.
+# A idempotência via silver.processed_files garante que reruns são seguros —
+# se o bronze ainda não terminou, esta DAG encerra sem fazer nada e tenta novamente.
 with DAG(
     'silver_match_history',
     default_args=default_args,
-    schedule_interval=None,
+    schedule_interval='*/30 * * * *',
     catchup=False,
     max_active_runs=1,
     tags=['starcraft', 'esports', 'silver', 'match_history'],

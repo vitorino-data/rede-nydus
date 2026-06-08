@@ -15,6 +15,8 @@ sys.path.append('/opt/airflow/source')
 from utils.get_token import get_battle_net_access_token
 from utils.get_league_data import get_league_data_raw
 from utils.get_ladder import fetch_ladder_legacy_raw
+from utils.get_current_season import get_current_season_id
+from utils.bronze_schemas import validate_league_response, validate_legacy_ladder_response
 
 CLIENT_ID = os.getenv('BLIZZARD_CLIENT_ID', 'COLOQUE_SEU_CLIENT_ID_AQUI')
 CLIENT_SECRET = os.getenv('BLIZZARD_CLIENT_SECRET', 'COLOQUE_SEU_SECRET_AQUI')
@@ -36,6 +38,11 @@ def _get_token(**context):
     return token
 
 
+def _get_current_season(**context):
+    token = context['ti'].xcom_pull(task_ids='get_token')
+    return get_current_season_id(token)
+
+
 def _extract_leagues(**context):
     """
     Puxa os dados de estrutura de todas as ligas (divisões e ladder_ids).
@@ -43,18 +50,20 @@ def _extract_leagues(**context):
     Frequência: 1x/dia — estrutura de ligas não muda com frequência.
     """
     token = context['ti'].xcom_pull(task_ids='get_token')
+    season_id = context['ti'].xcom_pull(task_ids='get_current_season')
     exec_date = context['logical_date'].strftime('%Y-%m-%d_%H%M')
     os.makedirs(BRONZE_PATH, exist_ok=True)
 
     all_ladder_ids = {}
 
     for league_id, league_name in LEAGUES.items():
-        print(f"Baixando estrutura da liga {league_name} (id={league_id})...")
+        print(f"Baixando estrutura da liga {league_name} (id={league_id}), season {season_id}...")
         try:
             raw_data = get_league_data_raw(
-                season_id=66, queue_id=201, team_type=0,
+                season_id=season_id, queue_id=201, team_type=0,
                 league_id=league_id, token=token
             )
+            validate_league_response(raw_data, league_id)
         except Exception as e:
             print(f"Erro ao buscar liga {league_name}: {e}")
             continue
@@ -89,6 +98,7 @@ def _extract_legacy_ladders(**context):
         try:
             data = fetch_ladder_legacy_raw(acesso=token, ladder_id=ladder_id)
             if data:
+                validate_legacy_ladder_response(data, ladder_id)
                 return {"ladder_id": ladder_id, "data": data}
         except Exception as e:
             print(f"Erro no ladder legacy {ladder_id}: {e}")
@@ -131,7 +141,8 @@ with DAG(
 ) as dag:
 
     get_token = PythonOperator(task_id='get_token', python_callable=_get_token)
+    get_current_season = PythonOperator(task_id='get_current_season', python_callable=_get_current_season)
     extract_leagues = PythonOperator(task_id='extract_leagues', python_callable=_extract_leagues)
     extract_legacy_ladders = PythonOperator(task_id='extract_legacy_ladders', python_callable=_extract_legacy_ladders)
 
-    get_token >> extract_leagues >> extract_legacy_ladders
+    get_token >> get_current_season >> extract_leagues >> extract_legacy_ladders

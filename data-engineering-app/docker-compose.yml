@@ -1,41 +1,109 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:13
+
+  # --------------------------------------------------------------------------
+  # Banco de metadados do Airflow (scheduler, DAG runs, XCom, conexões)
+  # Isolado do banco de dados para não disputar recursos com as cargas do pipeline.
+  # --------------------------------------------------------------------------
+  postgres_airflow:
+    image: postgres:15
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: mydatabase
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_airflow_data:/var/lib/postgresql/data
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER:-airflow} -d ${AIRFLOW_DB_NAME:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
+  # --------------------------------------------------------------------------
+  # Banco de dados principal: schemas silver, gold + metadados do Metabase.
+  # Exposto na porta 5432 para acesso direto via psql/DBeaver durante desenvolvimento.
+  # O script init-db/01_create_metabase_db.sql cria o banco 'metabase' na
+  # primeira inicialização, sem impactar o banco de dados principal (mydatabase).
+  # --------------------------------------------------------------------------
+  postgres_data:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DATA_DB_USER:-user}
+      POSTGRES_PASSWORD: ${DATA_DB_PASSWORD:-password}
+      POSTGRES_DB: ${DATA_DB_NAME:-mydatabase}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data_vol:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATA_DB_USER:-user} -d ${DATA_DB_NAME:-mydatabase}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Orquestrador: lê metadados de postgres_airflow e grava dados em postgres_data.
+  # SILVER_DB_CONN: usado pelos utils Python (silver_loader.py) dentro do container.
+  # AIRFLOW_CONN_POSTGRES_DEFAULT: usado pelos PostgresOperators (dag_gold_analytics).
+  # --------------------------------------------------------------------------
   airflow:
     image: apache/airflow:2.7.2
     command: standalone
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://user:password@postgres:5432/mydatabase
-      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://user:password@postgres:5432/mydatabase
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow:5432/${AIRFLOW_DB_NAME:-airflow}
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow:5432/${AIRFLOW_DB_NAME:-airflow}
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: 'admin'
       _AIRFLOW_WWW_USER_PASSWORD: 'admin'
+      AIRFLOW_CONN_POSTGRES_DEFAULT: postgresql://${DATA_DB_USER:-user}:${DATA_DB_PASSWORD:-password}@postgres_data:5432/${DATA_DB_NAME:-mydatabase}
+      SILVER_DB_CONN: postgresql://${DATA_DB_USER:-user}:${DATA_DB_PASSWORD:-password}@postgres_data:5432/${DATA_DB_NAME:-mydatabase}
       BLIZZARD_CLIENT_ID: ${BLIZZARD_CLIENT_ID}
       BLIZZARD_CLIENT_SECRET: ${BLIZZARD_CLIENT_SECRET}
     env_file:
       - .env
     ports:
-      - "8080:8080"
+      - "8081:8080"
     volumes:
       - ./dags:/opt/airflow/dags
       - ../source:/opt/airflow/source
     depends_on:
-      - postgres
+      postgres_airflow:
+        condition: service_healthy
+      postgres_data:
+        condition: service_healthy
+    networks:
+      - data-network
+
+  # --------------------------------------------------------------------------
+  # Ferramenta de análise e visualização de dados.
+  # Metadados internos do Metabase ficam no banco 'metabase' dentro do postgres_data.
+  # A fonte de dados (silver/gold) é configurada na UI do Metabase após a primeira subida:
+  #   Host: postgres_data | Porta: 5432 | Banco: mydatabase | Schema: silver ou gold
+  # --------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:latest
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres_data
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: ${DATA_DB_USER:-user}
+      MB_DB_PASS: ${DATA_DB_PASSWORD:-password}
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres_data:
+        condition: service_healthy
     networks:
       - data-network
 
@@ -44,4 +112,5 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:
+  postgres_airflow_data:
+  postgres_data_vol:

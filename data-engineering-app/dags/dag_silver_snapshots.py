@@ -11,44 +11,76 @@ sys.path.append('/opt/airflow/source')
 BRONZE_PATH = '/opt/airflow/source/bronze'
 SILVER_PATH = '/opt/airflow/source/silver'
 
-# Janela de reprocessamento: últimos N arquivos por liga.
-# Cobre falhas e variações de intervalo sem depender do relógio.
-WINDOW_SIZE = 10
+# Janela de reprocessamento configurável via Airflow Variable 'silver_snapshots_window_size'.
+# Padrão: 10 arquivos por liga. Aumente se o silver ficar atrás do bronze por longos períodos.
+# Para alterar sem reiniciar: Admin > Variables > silver_snapshots_window_size no Airflow UI.
+DEFAULT_WINDOW_SIZE = 10
 
 # Ligas disponíveis na API Blizzard SC2: Platinum=3, Diamond=4, Master=5, Grandmaster=6
 LEAGUE_IDS = [3, 4, 5, 6]
 
 
+def _get_window_size() -> int:
+    try:
+        from airflow.models import Variable
+        return int(Variable.get('silver_snapshots_window_size', default_var=str(DEFAULT_WINDOW_SIZE)))
+    except Exception:
+        return DEFAULT_WINDOW_SIZE
+
+
 def _process_and_load(bronze_pattern, silver_subdir, transform_fn, load_fn):
     """
     Utilitário reutilizado por todas as tasks:
-    1. Pega os últimos WINDOW_SIZE arquivos que casam com bronze_pattern
-    2. Para cada um, verifica silver.processed_files
-    3. Se não processado: transforma, carrega no Postgres, registra como processado
-    4. Se já processado: pula sem fazer nada
+    1. Determina WINDOW_SIZE via Airflow Variable (padrão: 10)
+    2. Emite aviso se houver acúmulo de arquivos além da janela atual
+    3. Pega os últimos WINDOW_SIZE arquivos que casam com bronze_pattern
+    4. Para cada um, verifica silver.processed_files
+    5. Se não processado: transforma, carrega no Postgres, registra como processado
+    6. Se já processado: pula sem fazer nada
+    7. Loga resumo de inseridos e ignorados ao final
     """
     from utils.silver_loader import is_file_processed, mark_file_processed
 
-    files = sorted(glob.glob(bronze_pattern))[-WINDOW_SIZE:]
+    window_size = _get_window_size()
+    all_files = sorted(glob.glob(bronze_pattern))
 
-    if not files:
+    if not all_files:
         print(f"Nenhum arquivo encontrado para o padrão: {bronze_pattern}")
         return
 
+    total_files = len(all_files)
+    if total_files > 2 * window_size:
+        unprocessed_estimate = total_files - window_size
+        print(
+            f"[LAG] {unprocessed_estimate} arquivo(s) estimado(s) fora da janela em '{bronze_pattern}'. "
+            f"Total: {total_files}, janela: {window_size}. "
+            f"Considere aumentar a Airflow Variable 'silver_snapshots_window_size'."
+        )
+
+    files = all_files[-window_size:]
     os.makedirs(f"{SILVER_PATH}/{silver_subdir}", exist_ok=True)
+
+    inserted_total = 0
+    skipped = 0
 
     for filepath in files:
         filename = os.path.basename(filepath)
 
         if is_file_processed(filename):
-            print(f"Já processado, pulando: {filename}")
+            skipped += 1
             continue
 
         print(f"Processando: {filename}")
         df = transform_fn(filepath)
         inserted = load_fn(df)
         mark_file_processed(filename)
-        print(f"Concluído: {filename} -> {inserted} linhas inseridas")
+        inserted_total += inserted
+
+    print(
+        f"[{silver_subdir}] Resumo: {len(files)} arquivo(s) na janela | "
+        f"{len(files) - skipped} processado(s) | {skipped} ignorado(s) (já na silver) | "
+        f"{inserted_total} linha(s) inserida(s)."
+    )
 
 
 def _process_league(**context):
