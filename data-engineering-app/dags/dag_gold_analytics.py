@@ -2,326 +2,399 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 
-# Argumentos padrão
 default_args = {
-    'owner': 'airflow',
+    'owner': 'capitao_sc2',
     'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
-    'email_on_failure': False,
-    'email_on_retry': False,
+    'start_date': datetime(2026, 1, 1),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
 
-# Definição da DAG
+# ==============================================================================
+# DDL
+# ==============================================================================
+
+_DDL_GOLD_SCHEMA = "CREATE SCHEMA IF NOT EXISTS gold;"
+
+_DDL_DIM_PLAYERS = """
+CREATE TABLE IF NOT EXISTS gold.dim_players (
+    character_id   INTEGER    NOT NULL,
+    race           TEXT       NOT NULL,
+    battle_tag     TEXT,
+    display_name   TEXT,
+    clan_tag       TEXT,
+    legacy_names   JSONB      NOT NULL DEFAULT '[]',
+    legacy_clans   JSONB      NOT NULL DEFAULT '[]',
+    updated_at     TIMESTAMP  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (character_id, race)
+);
+"""
+
+_DDL_FACT_MMR_TRACK = """
+CREATE TABLE IF NOT EXISTS gold.fact_mmr_track (
+    character_id  INTEGER    NOT NULL,
+    race          TEXT       NOT NULL,
+    snapshot_ts   TIMESTAMP  NOT NULL,
+    ladder_id     INTEGER,
+    rating        INTEGER,
+    wins          INTEGER,
+    losses        INTEGER,
+    PRIMARY KEY (character_id, race, snapshot_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_mmr_track_lookup
+    ON gold.fact_mmr_track (character_id, race, snapshot_ts DESC);
+"""
+
+_DDL_FACT_MATCHES = """
+CREATE TABLE IF NOT EXISTS gold.fact_matches (
+    match_id             TEXT       PRIMARY KEY,
+    match_date           TIMESTAMP  NOT NULL,
+    map                  TEXT,
+    type                 TEXT,
+    p1_character_id      INTEGER    NOT NULL,
+    p1_decision          TEXT,
+    p1_race_inferred     TEXT,
+    p1_race_confidence   TEXT,
+    p2_character_id      INTEGER,
+    p2_decision          TEXT,
+    p2_race_inferred     TEXT,
+    p2_race_confidence   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fact_matches_p1
+    ON gold.fact_matches (p1_character_id, match_date);
+CREATE INDEX IF NOT EXISTS idx_fact_matches_p2
+    ON gold.fact_matches (p2_character_id, match_date);
+"""
+
+# ==============================================================================
+# DML — dim_players
+# Fonte: modern_ladder_teams (battle_tag, race) + legacy_ladder_members (display_name, clan_tag)
+# Snapshot mais recente por (character_id, race).
+# ON CONFLICT: atualiza campos atuais e faz append nos arrays legacy quando o valor muda.
+# ==============================================================================
+
+_DML_DIM_PLAYERS = """
+WITH latest_modern AS (
+    SELECT DISTINCT ON (character_id, primary_race)
+        character_id,
+        primary_race   AS race,
+        battle_tag,
+        character_name AS display_name_modern
+    FROM silver.modern_ladder_teams
+    WHERE primary_race IS NOT NULL
+      AND character_id IS NOT NULL
+    ORDER BY character_id, primary_race, snapshot_ts DESC
+),
+latest_legacy AS (
+    SELECT DISTINCT ON (character_id)
+        character_id,
+        display_name,
+        clan_tag
+    FROM silver.legacy_ladder_members
+    WHERE character_id IS NOT NULL
+    ORDER BY character_id, snapshot_ts DESC
+)
+INSERT INTO gold.dim_players (character_id, race, battle_tag, display_name, clan_tag, updated_at)
+SELECT
+    m.character_id,
+    m.race,
+    m.battle_tag,
+    COALESCE(l.display_name, m.display_name_modern) AS display_name,
+    l.clan_tag,
+    NOW()
+FROM latest_modern m
+LEFT JOIN latest_legacy l ON l.character_id = m.character_id
+ON CONFLICT (character_id, race) DO UPDATE SET
+    battle_tag   = EXCLUDED.battle_tag,
+    legacy_names = CASE
+        WHEN EXCLUDED.display_name IS NOT NULL
+         AND gold.dim_players.display_name IS NOT NULL
+         AND EXCLUDED.display_name IS DISTINCT FROM gold.dim_players.display_name
+        THEN gold.dim_players.legacy_names || jsonb_build_array(
+                jsonb_build_object('name', gold.dim_players.display_name, 'since', NOW()::date::text)
+             )
+        ELSE gold.dim_players.legacy_names
+    END,
+    legacy_clans = CASE
+        WHEN EXCLUDED.clan_tag IS NOT NULL
+         AND gold.dim_players.clan_tag IS NOT NULL
+         AND EXCLUDED.clan_tag IS DISTINCT FROM gold.dim_players.clan_tag
+        THEN gold.dim_players.legacy_clans || jsonb_build_array(
+                jsonb_build_object('clan', gold.dim_players.clan_tag, 'since', NOW()::date::text)
+             )
+        ELSE gold.dim_players.legacy_clans
+    END,
+    display_name = EXCLUDED.display_name,
+    clan_tag     = COALESCE(EXCLUDED.clan_tag, gold.dim_players.clan_tag),
+    updated_at   = NOW();
+"""
+
+# ==============================================================================
+# DML — fact_mmr_track
+# Janela rolante de 3 dias. ON CONFLICT DO NOTHING — idempotente.
+# ==============================================================================
+
+_DML_FACT_MMR_TRACK = """
+INSERT INTO gold.fact_mmr_track (character_id, race, snapshot_ts, ladder_id, rating, wins, losses)
+SELECT
+    character_id,
+    primary_race AS race,
+    snapshot_ts,
+    ladder_id,
+    rating,
+    wins,
+    losses
+FROM silver.modern_ladder_teams
+WHERE primary_race IS NOT NULL
+  AND character_id IS NOT NULL
+  AND snapshot_ts >= NOW() - INTERVAL '3 days'
+ON CONFLICT (character_id, race, snapshot_ts) DO NOTHING;
+"""
+
+# ==============================================================================
+# DML — fact_matches
+# Reconstrói partidas 1v1 via self-join em silver.match_history.
+# Janela rolante de 3 dias por snapshot_date.
+#
+# Inferência de raça (3 níveis de confiança):
+#   HIGH    — jogador tem só uma raça em dim_players (certeza estrutural)
+#   BOOSTED — jogador tem múltiplas raças, mas há match HIGH nos últimos 90 min
+#             (session momentum: quem joga Zerg tende a continuar jogando Zerg)
+#   LOW     — jogador flex sem evidência recente suficiente
+#
+# Correção para partidas sem adversário no dataset (p2=NULL):
+#   Usa a raça com MAIOR MMR (raça principal) em vez da menor diferença para zero.
+#
+# ON CONFLICT DO UPDATE — reruns corrigem inferências existentes automaticamente.
+# ==============================================================================
+
+_DML_FACT_MATCHES = """
+WITH
+rolling_window AS (
+    SELECT profile_id, match_date, map, type, decision
+    FROM silver.match_history
+    WHERE type = '1v1'
+      AND snapshot_date >= CURRENT_DATE - INTERVAL '3 days'
+),
+matched_games AS (
+    SELECT
+        LEAST(m1.profile_id, m2.profile_id)    AS p1_id,
+        GREATEST(m1.profile_id, m2.profile_id) AS p2_id,
+        m1.match_date, m1.map, m1.type,
+        CASE WHEN m1.profile_id < m2.profile_id THEN m1.decision ELSE m2.decision END AS p1_decision,
+        CASE WHEN m1.profile_id < m2.profile_id THEN m2.decision ELSE m1.decision END AS p2_decision
+    FROM rolling_window m1
+    JOIN silver.match_history m2
+      ON  m1.match_date  = m2.match_date
+      AND m1.map         = m2.map
+      AND m1.type        = m2.type
+      AND m1.profile_id  < m2.profile_id
+      AND m1.decision   != m2.decision
+      AND m2.type = '1v1'
+),
+matched_profiles AS (
+    SELECT p1_id AS profile_id, match_date, map FROM matched_games
+    UNION ALL
+    SELECT p2_id,               match_date, map FROM matched_games
+),
+unmatched_games AS (
+    SELECT
+        m.profile_id  AS p1_id,
+        NULL::integer AS p2_id,
+        m.match_date, m.map, m.type,
+        m.decision    AS p1_decision,
+        NULL::text    AS p2_decision
+    FROM rolling_window m
+    WHERE NOT EXISTS (
+        SELECT 1 FROM matched_profiles mp
+        WHERE mp.profile_id = m.profile_id
+          AND mp.match_date = m.match_date
+          AND mp.map        = m.map
+    )
+),
+all_games AS (
+    SELECT * FROM matched_games
+    UNION ALL
+    SELECT * FROM unmatched_games
+),
+latest_mmr AS (
+    SELECT DISTINCT ON (character_id, race)
+        character_id, race, rating
+    FROM gold.fact_mmr_track
+    ORDER BY character_id, race, snapshot_ts DESC
+),
+race_combinations AS (
+    SELECT
+        g.*,
+        p1m.race   AS p1_race,
+        p2m.race   AS p2_race,
+        p1m.rating AS p1_rating,
+        p2m.rating AS p2_rating,
+        ROW_NUMBER() OVER (
+            PARTITION BY g.p1_id, g.p2_id, g.match_date, g.map
+            ORDER BY
+                CASE
+                    -- Sem adversário: usa raça com maior MMR (raça principal)
+                    WHEN g.p2_id IS NULL THEN -COALESCE(p1m.rating, 0)
+                    -- Com adversário: par de raças com menor diferença de MMR
+                    ELSE ABS(COALESCE(p1m.rating, 0) - COALESCE(p2m.rating, 0))
+                END ASC
+        ) AS rn
+    FROM all_games g
+    LEFT JOIN latest_mmr p1m ON p1m.character_id = g.p1_id
+    LEFT JOIN latest_mmr p2m ON p2m.character_id = g.p2_id
+),
+best_race AS (
+    SELECT * FROM race_combinations WHERE rn = 1
+),
+player_race_count AS (
+    SELECT character_id, COUNT(DISTINCT race) AS race_count
+    FROM gold.dim_players
+    GROUP BY character_id
+),
+initial_inference AS (
+    SELECT
+        br.*,
+        CASE WHEN prc1.race_count = 1 THEN 'HIGH' ELSE 'LOW' END AS p1_confidence_raw,
+        CASE
+            WHEN br.p2_id IS NOT NULL AND prc2.race_count = 1 THEN 'HIGH'
+            WHEN br.p2_id IS NOT NULL                         THEN 'LOW'
+            ELSE NULL
+        END AS p2_confidence_raw
+    FROM best_race br
+    LEFT JOIN player_race_count prc1 ON prc1.character_id = br.p1_id
+    LEFT JOIN player_race_count prc2 ON prc2.character_id = br.p2_id
+),
+-- Visão unificada de classificações HIGH por jogador (aparece como p1 ou p2)
+player_high_confidence AS (
+    SELECT p1_id AS character_id, match_date, p1_race AS race
+    FROM initial_inference
+    WHERE p1_confidence_raw = 'HIGH' AND p1_race IS NOT NULL
+    UNION ALL
+    SELECT p2_id, match_date, p2_race
+    FROM initial_inference
+    WHERE p2_id IS NOT NULL AND p2_confidence_raw = 'HIGH' AND p2_race IS NOT NULL
+),
+-- Raça HIGH mais recente nos últimos 90 min para cada match LOW (posição p1)
+p1_boost AS (
+    SELECT DISTINCT ON (ii.p1_id, ii.match_date)
+        ii.p1_id,
+        ii.match_date,
+        ph.race AS boosted_race
+    FROM initial_inference ii
+    JOIN player_high_confidence ph
+      ON ph.character_id = ii.p1_id
+      AND ph.match_date < ii.match_date
+      AND ph.match_date >= ii.match_date - INTERVAL '90 minutes'
+    WHERE ii.p1_confidence_raw = 'LOW'
+    ORDER BY ii.p1_id, ii.match_date, ph.match_date DESC
+),
+-- Raça HIGH mais recente nos últimos 90 min para cada match LOW (posição p2)
+p2_boost AS (
+    SELECT DISTINCT ON (ii.p2_id, ii.match_date)
+        ii.p2_id,
+        ii.match_date,
+        ph.race AS boosted_race
+    FROM initial_inference ii
+    JOIN player_high_confidence ph
+      ON ph.character_id = ii.p2_id
+      AND ph.match_date < ii.match_date
+      AND ph.match_date >= ii.match_date - INTERVAL '90 minutes'
+    WHERE ii.p2_id IS NOT NULL AND ii.p2_confidence_raw = 'LOW'
+    ORDER BY ii.p2_id, ii.match_date, ph.match_date DESC
+)
+INSERT INTO gold.fact_matches (
+    match_id,
+    match_date, map, type,
+    p1_character_id, p1_decision, p1_race_inferred, p1_race_confidence,
+    p2_character_id, p2_decision, p2_race_inferred, p2_race_confidence
+)
+SELECT
+    md5(ii.p1_id::text || COALESCE(ii.p2_id::text, '') || ii.match_date::text || ii.map::text) AS match_id,
+    ii.match_date, ii.map, ii.type,
+    ii.p1_id, ii.p1_decision,
+    COALESCE(b1.boosted_race, ii.p1_race)    AS p1_race_inferred,
+    CASE
+        WHEN b1.boosted_race IS NOT NULL THEN 'BOOSTED'
+        ELSE ii.p1_confidence_raw
+    END                                      AS p1_race_confidence,
+    ii.p2_id, ii.p2_decision,
+    COALESCE(b2.boosted_race, ii.p2_race)    AS p2_race_inferred,
+    CASE
+        WHEN ii.p2_id IS NULL               THEN NULL
+        WHEN b2.boosted_race IS NOT NULL    THEN 'BOOSTED'
+        ELSE ii.p2_confidence_raw
+    END                                      AS p2_race_confidence
+FROM initial_inference ii
+LEFT JOIN p1_boost b1 ON b1.p1_id    = ii.p1_id AND b1.match_date = ii.match_date
+LEFT JOIN p2_boost b2 ON b2.p2_id    = ii.p2_id AND b2.match_date = ii.match_date
+ON CONFLICT (match_id) DO UPDATE SET
+    p1_race_inferred   = EXCLUDED.p1_race_inferred,
+    p1_race_confidence = EXCLUDED.p1_race_confidence,
+    p2_race_inferred   = EXCLUDED.p2_race_inferred,
+    p2_race_confidence = EXCLUDED.p2_race_confidence;
+"""
+
+# ==============================================================================
+# DAG
+# ==============================================================================
+
 with DAG(
     'dag_gold_analytics',
     default_args=default_args,
-    description='Pipeline de transformaçao Camada Gold (Analytics)',
+    description='Camada Gold: dim_players, fact_mmr_track, fact_matches',
     schedule_interval='@daily',
     catchup=False,
-    tags=['gold', 'analytics', 'postgres'],
+    max_active_runs=1,
+    tags=['gold', 'analytics', 'starcraft'],
 ) as dag:
 
-    # 1. Criação do Schema Gold (se não existir)
     create_schema = PostgresOperator(
         task_id='create_gold_schema',
         postgres_conn_id='postgres_default',
-        sql="CREATE SCHEMA IF NOT EXISTS gold;"
+        sql=_DDL_GOLD_SCHEMA,
     )
 
-    # ------------------------------------------------------------------
-    # Tabela 1: Estatísticas Diárias por Jogador (Player Stats Daily)
-    # ------------------------------------------------------------------
-
-    # Cria tabela se não existir
-    create_player_stats_ddl = PostgresOperator(
-        task_id='create_gold_player_stats_daily_ddl',
+    create_dim_players = PostgresOperator(
+        task_id='create_dim_players',
         postgres_conn_id='postgres_default',
-        sql="""
-            CREATE TABLE IF NOT EXISTS gold.player_stats_daily (
-                profile_id INT,
-                match_date DATE,
-                matches_played INT,
-                wins INT,
-                losses INT,
-                win_rate FLOAT,
-                updated_at TIMESTAMP DEFAULT NOW(),
-                PRIMARY KEY (profile_id, match_date)
-            );
-        """
+        sql=_DDL_DIM_PLAYERS,
     )
-    
-    # Popula com dados agregados da camada Silver (Upsert)
-    populate_player_stats_dml = PostgresOperator(
-        task_id='populate_gold_player_stats_daily_dml',
+
+    create_fact_mmr_track = PostgresOperator(
+        task_id='create_fact_mmr_track',
         postgres_conn_id='postgres_default',
-        sql="""
-            INSERT INTO gold.player_stats_daily (profile_id, match_date, matches_played, wins, losses, win_rate, updated_at)
-            SELECT
-                profile_id,
-                DATE(match_date) as match_date,
-                COUNT(*) as matches_played,
-                COUNT(*) FILTER (WHERE decision = 'WIN') as wins,
-                COUNT(*) FILTER (WHERE decision = 'LOSS') as losses,
-                CASE 
-                    WHEN COUNT(*) > 0 THEN (COUNT(*) FILTER (WHERE decision = 'WIN')::FLOAT / COUNT(*)) 
-                    ELSE 0 
-                END as win_rate,
-                NOW()
-            FROM silver.match_history
-            GROUP BY profile_id, DATE(match_date)
-            ON CONFLICT (profile_id, match_date) 
-            DO UPDATE SET
-                matches_played = EXCLUDED.matches_played,
-                wins = EXCLUDED.wins,
-                losses = EXCLUDED.losses,
-                win_rate = EXCLUDED.win_rate,
-                updated_at = EXCLUDED.updated_at;
-        """
+        sql=_DDL_FACT_MMR_TRACK,
     )
 
-    # ------------------------------------------------------------------
-    # Tabela 2: Histórico de MMR e Stats (Checkpoints)
-    # ------------------------------------------------------------------
-
-    # DDL: MMR Checkpoints
-    create_mmr_checkpoints_ddl = PostgresOperator(
-        task_id='create_gold_mmr_checkpoints_ddl',
+    create_fact_matches = PostgresOperator(
+        task_id='create_fact_matches',
         postgres_conn_id='postgres_default',
-        sql="""
-            CREATE TABLE IF NOT EXISTS gold.mmr_checkpoints (
-                ladder_id INT,
-                profile_id INT,
-                snapshot_ts TIMESTAMP,
-                rating INT,
-                wins INT,
-                losses INT,
-                primary_race TEXT,
-                updated_at TIMESTAMP DEFAULT NOW(),
-                PRIMARY KEY (ladder_id, profile_id, snapshot_ts)
-            );
-        """
+        sql=_DDL_FACT_MATCHES,
     )
 
-    # DML: Popula MMR Checkpoints (Upsert)
-    populate_mmr_checkpoints_dml = PostgresOperator(
-        task_id='populate_gold_mmr_checkpoints_dml',
+    load_dim_players = PostgresOperator(
+        task_id='load_dim_players',
         postgres_conn_id='postgres_default',
-        sql="""
-            INSERT INTO gold.mmr_checkpoints (ladder_id, profile_id, snapshot_ts, rating, wins, losses, primary_race, updated_at)
-            SELECT
-                ladder_id,
-                character_id as profile_id,
-                snapshot_ts,
-                rating,
-                wins,
-                losses,
-                primary_race,
-                NOW()
-            FROM silver.modern_ladder_teams
-            ON CONFLICT (ladder_id, profile_id, snapshot_ts)
-            DO UPDATE SET
-                rating = EXCLUDED.rating,
-                wins = EXCLUDED.wins,
-                losses = EXCLUDED.losses,
-                primary_race = EXCLUDED.primary_race,
-                updated_at = EXCLUDED.updated_at;
-        """
+        sql=_DML_DIM_PLAYERS,
     )
 
-
-    # ------------------------------------------------------------------
-    # Tabela 3: Fato Partidas Enriquecidas (Fact Matches) - DESATIVADA TEMPORARIAMENTE
-    # ------------------------------------------------------------------
-
-    # DDL: Fact Matches
-    # create_fact_matches_ddl = PostgresOperator(
-    #     task_id='create_gold_fact_matches_ddl',
-    #     postgres_conn_id='postgres_default',
-    #     sql="""
-    #         CREATE TABLE IF NOT EXISTS gold.fact_matches (
-    #             match_id TEXT PRIMARY KEY,
-    #             match_date TIMESTAMP NOT NULL,
-    #             map_name TEXT,
-    #             game_type TEXT,
-    #             
-    #             -- Player 1
-    #             p1_profile_id INT,
-    #             p1_result TEXT,
-    #             p1_race_inferred TEXT,
-    #             p1_mmr_inferred INT,
-    #             
-    #             -- Player 2 (Oponente)
-    #             p2_profile_id INT,
-    #             p2_result TEXT,
-    #             p2_race_inferred TEXT,
-    #             p2_mmr_inferred INT,
-    #             
-    #             updated_at TIMESTAMP DEFAULT NOW()
-    #         );
-    #     """
-    # )
-
-    # DML: Popula Fact Matches (Lógica Complexa de Inferência)
-    # populate_fact_matches_dml = PostgresOperator(
-    #     task_id='populate_gold_fact_matches_dml',
-    #     postgres_conn_id='postgres_default',
-    #     sql="""
-    #         WITH raw_matches AS (
-    #             -- Auto-join para encontrar oponente (P1 vs P2)
-    #             SELECT
-    #                 m1.profile_id as p1_id,
-    #                 m1.decision as p1_result,
-    #                 m2.profile_id as p2_id,
-    #                 m2.decision as p2_result,
-    #                 m1.match_date,
-    #                 m1.map,
-    #                 m1.type
-    #             FROM silver.match_history m1
-    #             JOIN silver.match_history m2 
-    #                 ON m1.map = m2.map 
-    #                 AND m1.type = m2.type 
-    #                 -- Tolerância rígida: < 1 segundo de diferença para match exato
-    #                 AND m1.match_date BETWEEN m2.match_date - INTERVAL '1 second' AND m2.match_date + INTERVAL '1 second'
-    #                 AND m1.profile_id < m2.profile_id -- Evita duplicatas (A vs B e B vs A)
-    #         ),
-    #         enriched_matches AS (
-    #             SELECT
-    #                 rm.*,
-    #                 -- Inferência P1: Snapshot mais próximo (usando LATERAL)
-    #                 p1_snap.primary_race as p1_race,
-    #                 p1_snap.rating as p1_mmr,
-    #                 -- Inferência P2: Snapshot mais próximo (usando LATERAL)
-    #                 p2_snap.primary_race as p2_race,
-    #                 p2_snap.rating as p2_mmr
-    #             FROM raw_matches rm
-    #             LEFT JOIN LATERAL (
-    #                 SELECT primary_race, rating 
-    #                 FROM silver.modern_ladder_teams t
-    #                 WHERE t.character_id = rm.p1_id
-    #                 ORDER BY ABS(EXTRACT(EPOCH FROM (t.snapshot_ts - rm.match_date))) ASC
-    #                 LIMIT 1
-    #             ) p1_snap ON TRUE
-    #             LEFT JOIN LATERAL (
-    #                 SELECT primary_race, rating 
-    #                 FROM silver.modern_ladder_teams t
-    #                 WHERE t.character_id = rm.p2_id
-    #                 ORDER BY ABS(EXTRACT(EPOCH FROM (t.snapshot_ts - rm.match_date))) ASC
-    #                 LIMIT 1
-    #             ) p2_snap ON TRUE
-    #         )
-    #         INSERT INTO gold.fact_matches (
-    #             match_id, match_date, map_name, game_type,
-    #             p1_profile_id, p1_result, p1_race_inferred, p1_mmr_inferred,
-    #             p2_profile_id, p2_result, p2_race_inferred, p2_mmr_inferred,
-    #             updated_at
-    #         )
-    #         SELECT
-    #             md5(p1_id::text || p2_id::text || match_date::text) as match_id,
-    #             match_date, map, type,
-    #             p1_id, p1_result, p1_race, p1_mmr,
-    #             p2_id, p2_result, p2_race, p2_mmr,
-    #             NOW()
-    #         FROM enriched_matches
-    #         ON CONFLICT (match_id) DO NOTHING;
-    #     """
-    # )
-
-
-    # ------------------------------------------------------------------
-    # Tabela 4: Monitoramento de MMR Diário e Clã (MMR Tracker)
-    # ------------------------------------------------------------------
-
-    # Objetivo: Acompanhar evolução de MMR e verificar regras de campeonato (teto de MMR)
-    # Fonte: silver.modern_ladder_teams (MMR) + silver.legacy_ladder_members (Clan Tag)
-
-    create_mmr_stats_ddl = PostgresOperator(
-        task_id='create_gold_player_mmr_daily_ddl',
+    load_fact_mmr_track = PostgresOperator(
+        task_id='load_fact_mmr_track',
         postgres_conn_id='postgres_default',
-        sql="""
-            CREATE TABLE IF NOT EXISTS gold.player_mmr_daily (
-                profile_id INT,
-                snapshot_date DATE,
-                battle_tag TEXT,
-                clan_tag TEXT,
-                primary_race TEXT,
-                max_mmr INT,
-                current_mmr INT,
-                wins INT,
-                losses INT,
-                updated_at TIMESTAMP DEFAULT NOW(),
-                PRIMARY KEY (profile_id, snapshot_date)
-            );
-        """
+        sql=_DML_FACT_MMR_TRACK,
     )
 
-    populate_mmr_stats_dml = PostgresOperator(
-        task_id='populate_gold_player_mmr_daily_dml',
+    load_fact_matches = PostgresOperator(
+        task_id='load_fact_matches',
         postgres_conn_id='postgres_default',
-        sql="""
-            WITH joined_data AS (
-                SELECT
-                    m.character_id,
-                    DATE(m.snapshot_ts) as snapshot_date,
-                    m.rating,
-                    m.wins,
-                    m.losses,
-                    m.snapshot_ts,
-                    m.battle_tag,
-                    m.primary_race,
-                    l.clan_tag
-                FROM silver.modern_ladder_teams m
-                LEFT JOIN silver.legacy_ladder_members l
-                   ON m.ladder_id = l.ladder_id
-                   AND m.character_id = l.character_id
-                   AND m.snapshot_ts = l.snapshot_ts
-            ),
-            daily_aggregated AS (
-                SELECT
-                    character_id,
-                    snapshot_date,
-                    MAX(rating) as max_mmr,
-                    (ARRAY_AGG(rating ORDER BY snapshot_ts DESC))[1] as current_mmr,
-                    (ARRAY_AGG(wins ORDER BY snapshot_ts DESC))[1] as current_wins,
-                    (ARRAY_AGG(losses ORDER BY snapshot_ts DESC))[1] as current_losses,
-                    (ARRAY_AGG(battle_tag ORDER BY snapshot_ts DESC))[1] as battle_tag,
-                    (ARRAY_AGG(clan_tag ORDER BY snapshot_ts DESC))[1] as clan_tag,
-                    (ARRAY_AGG(primary_race ORDER BY snapshot_ts DESC))[1] as primary_race
-                FROM joined_data
-                GROUP BY character_id, snapshot_date
-            )
-            INSERT INTO gold.player_mmr_daily (
-                profile_id, snapshot_date, battle_tag, clan_tag, primary_race, 
-                max_mmr, current_mmr, wins, losses, updated_at
-            )
-            SELECT
-                character_id,
-                snapshot_date,
-                battle_tag,
-                clan_tag,
-                primary_race,
-                max_mmr,
-                current_mmr,
-                current_wins,
-                current_losses,
-                NOW()
-            FROM daily_aggregated
-            ON CONFLICT (profile_id, snapshot_date)
-            DO UPDATE SET
-                max_mmr = GREATEST(gold.player_mmr_daily.max_mmr, EXCLUDED.max_mmr),
-                current_mmr = EXCLUDED.current_mmr,
-                wins = EXCLUDED.wins,
-                losses = EXCLUDED.losses,
-                clan_tag = COALESCE(EXCLUDED.clan_tag, gold.player_mmr_daily.clan_tag),
-                updated_at = EXCLUDED.updated_at;
-        """
+        sql=_DML_FACT_MATCHES,
     )
 
-    # Definição de Dependências
-    
-    # CriaSchema >> DDLs >> DMLs
-    create_schema >> create_player_stats_ddl >> populate_player_stats_dml
-    create_schema >> create_mmr_checkpoints_ddl >> populate_mmr_checkpoints_dml
-    # create_schema >> create_fact_matches_ddl >> populate_fact_matches_dml
+    # DDLs em paralelo após criação do schema
+    create_schema >> [create_dim_players, create_fact_mmr_track, create_fact_matches]
 
+    # Carga em sequência: dim_players → fact_mmr_track → fact_matches
+    # fact_matches depende do fact_mmr_track (inferência de raça) e do dim_players (confiança)
+    [create_dim_players, create_fact_mmr_track, create_fact_matches] >> load_dim_players
+    load_dim_players >> load_fact_mmr_track >> load_fact_matches

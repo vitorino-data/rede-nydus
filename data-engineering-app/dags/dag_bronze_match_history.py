@@ -121,7 +121,7 @@ def _load_players(**context):
     changed_players = [
         p for p in unique_players.values()
         if p['current_games'] > 0
-        and p['current_games'] != checkpoint.get(p['id'], -1)
+        and p['current_games'] != checkpoint.get(int(p['id']), -1)
     ]
 
     total = len(unique_players)
@@ -162,7 +162,7 @@ def _update_checkpoint(**context):
         print("Nenhum jogador para atualizar no checkpoint.")
         return
 
-    player_counts = {p['id']: p['current_games'] for p in players}
+    player_counts = {int(p['id']): p['current_games'] for p in players}
     upsert_match_history_checkpoint(player_counts)
     print(f"Checkpoint atualizado para {len(player_counts)} jogadores.")
 
