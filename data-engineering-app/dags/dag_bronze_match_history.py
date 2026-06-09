@@ -4,6 +4,7 @@ import time
 import json
 import glob
 import threading
+import requests
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,7 +20,7 @@ sys.path.append('/opt/airflow/source')
 from utils.get_token import get_battle_net_access_token
 from utils.get_match_history import fetch_match_history_raw
 from utils.bronze_schemas import validate_match_history_response
-from utils.silver_loader import get_checkpoint_game_counts, upsert_match_history_checkpoint
+from utils.silver_loader import get_checkpoint_state, mark_players_unavailable, upsert_match_history_checkpoint
 
 CLIENT_ID = os.getenv('BLIZZARD_CLIENT_ID', 'COLOQUE_SEU_CLIENT_ID_AQUI')
 CLIENT_SECRET = os.getenv('BLIZZARD_CLIENT_SECRET', 'COLOQUE_SEU_SECRET_AQUI')
@@ -116,18 +117,19 @@ def _load_players(**context):
                             unique_players[char_id]['current_games'], current_games
                         )
 
-    checkpoint = get_checkpoint_game_counts()
+    checkpoint, blacklisted = get_checkpoint_state()
 
     changed_players = [
         p for p in unique_players.values()
         if p['current_games'] > 0
+        and int(p['id']) not in blacklisted
         and p['current_games'] != checkpoint.get(int(p['id']), -1)
     ]
 
     total = len(unique_players)
     changed = len(changed_players)
     skipped = total - changed
-    first_run = len(checkpoint) == 0
+    first_run = len(checkpoint) == 0 and len(blacklisted) == 0
     print(
         f"{'[PRIMEIRA EXECUÇÃO — full load] ' if first_run else ''}"
         f"Jogadores totais: {total} | "
@@ -197,6 +199,7 @@ def _extract_matches(**context):
     print(f"Iniciando extração de match history para {len(players)} jogadores...")
 
     all_matches_raw = []
+    all_unavailable = []
     rate_limiter = _RateLimiter(RATE_LIMIT_RPS)
 
     def fetch_player_matches(player):
@@ -208,6 +211,10 @@ def _extract_matches(**context):
             if data and data.get('matches'):
                 validate_match_history_response(data, player['id'])
                 return data
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return ('404', int(player['id']))
+            print(f"Erro ao buscar matches do jogador {player['id']}: {e}")
         except Exception as e:
             print(f"Erro ao buscar matches do jogador {player['id']}: {e}")
         return None
@@ -218,19 +225,29 @@ def _extract_matches(**context):
         batch_end = min(batch_start + CHECKPOINT_EVERY, len(players))
         print(f"[lote] Processando jogadores {batch_start + 1}–{batch_end} de {len(players)}...")
 
+        batch_unavailable = []
         with ThreadPoolExecutor(max_workers=MATCH_HISTORY_WORKERS) as executor:
             futures = {executor.submit(fetch_player_matches, p): p for p in batch}
             for future in as_completed(futures):
                 result = future.result()
-                if result:
+                if isinstance(result, tuple) and result[0] == '404':
+                    batch_unavailable.append(result[1])
+                elif result:
                     all_matches_raw.append(result)
+
+        if batch_unavailable:
+            mark_players_unavailable(batch_unavailable)
+            all_unavailable.extend(batch_unavailable)
 
         # Checkpoint: persiste o acumulado até aqui para não perder progresso
         with open(out_file, 'w', encoding='utf-8') as f:
             json.dump(all_matches_raw, f, ensure_ascii=False)
         print(f"Checkpoint salvo: {len(all_matches_raw)} registros em {out_file}")
 
-    print(f"Extração concluída: {len(all_matches_raw)} jogadores com partidas coletadas.")
+    print(
+        f"Extração concluída: {len(all_matches_raw)} jogadores com partidas coletadas | "
+        f"{len(all_unavailable)} adicionados à blacklist."
+    )
 
 
 default_args = {

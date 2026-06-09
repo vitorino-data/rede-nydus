@@ -127,11 +127,17 @@ _DDL_MATCH_HISTORY_CHECKPOINT = """
 CREATE SCHEMA IF NOT EXISTS silver;
 
 CREATE TABLE IF NOT EXISTS silver.match_history_checkpoint (
-    character_id  INTEGER   NOT NULL,
-    total_games   INTEGER   NOT NULL,
-    updated_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+    character_id    INTEGER   NOT NULL,
+    total_games     INTEGER   NOT NULL,
+    api_unavailable BOOLEAN   NOT NULL DEFAULT FALSE,
+    updated_at      TIMESTAMP NOT NULL DEFAULT NOW(),
     PRIMARY KEY (character_id)
 );
+"""
+
+_MIGRATION_CHECKPOINT_BLACKLIST = """
+ALTER TABLE silver.match_history_checkpoint
+    ADD COLUMN IF NOT EXISTS api_unavailable BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 
@@ -143,6 +149,7 @@ def ensure_silver_tables(cursor) -> None:
     cursor.execute(_DDL_MATCH_HISTORY)
     cursor.execute(_DDL_PROCESSED_FILES)
     cursor.execute(_DDL_MATCH_HISTORY_CHECKPOINT)
+    cursor.execute(_MIGRATION_CHECKPOINT_BLACKLIST)
 
 
 def is_file_processed(filename: str) -> bool:
@@ -271,17 +278,49 @@ def load_legacy_ladder_members(df: pd.DataFrame) -> int:
     return inserted
 
 
-def get_checkpoint_game_counts() -> dict:
+def get_checkpoint_state() -> tuple:
     """
-    Retorna {character_id: total_games} para todos os jogadores registrados
-    em silver.match_history_checkpoint.
-    Retorna dict vazio na primeira execução (sem checkpoint ainda).
+    Retorna (game_counts, blacklisted) onde:
+      game_counts: {character_id: total_games} — apenas jogadores ativos
+      blacklisted: set de character_ids com api_unavailable=TRUE
+    Retorna ({}, set()) na primeira execução.
     """
     with _get_connection() as conn:
         with conn.cursor() as cur:
             ensure_silver_tables(cur)
-            cur.execute("SELECT character_id, total_games FROM silver.match_history_checkpoint")
-            return {row[0]: row[1] for row in cur.fetchall()}
+            cur.execute(
+                "SELECT character_id, total_games, api_unavailable FROM silver.match_history_checkpoint"
+            )
+            game_counts = {}
+            blacklisted = set()
+            for char_id, total_games, unavailable in cur.fetchall():
+                if unavailable:
+                    blacklisted.add(char_id)
+                else:
+                    game_counts[char_id] = total_games
+            return game_counts, blacklisted
+
+
+def mark_players_unavailable(character_ids: list) -> None:
+    """
+    Marca jogadores como api_unavailable=TRUE no checkpoint.
+    Jogadores que ainda não têm registro recebem total_games=0.
+    """
+    if not character_ids:
+        return
+    rows = [(cid, 0, True) for cid in character_ids]
+    sql = """
+        INSERT INTO silver.match_history_checkpoint (character_id, total_games, api_unavailable)
+        VALUES %s
+        ON CONFLICT (character_id) DO UPDATE SET
+            api_unavailable = TRUE,
+            updated_at      = NOW()
+    """
+    with _get_connection() as conn:
+        with conn.cursor() as cur:
+            ensure_silver_tables(cur)
+            psycopg2.extras.execute_values(cur, sql, rows)
+    print(f"[match_history_checkpoint] {len(character_ids)} jogadores adicionados à blacklist.")
 
 
 def upsert_match_history_checkpoint(player_counts: dict) -> None:
