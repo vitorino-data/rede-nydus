@@ -152,6 +152,25 @@ def transform_modern_ladders_to_silver(bronze_path: str) -> pd.DataFrame:
         'primary_race_count',
     ]
     df[int_cols] = df[int_cols].astype('Int64')
+
+    # A API da Blizzard ocasionalmente retorna valores negativos como uint32
+    # (ex: rating=-67 vira 4294967229). Valores fora do range do PostgreSQL INTEGER
+    # são nulificados para evitar NumericValueOutOfRange no insert.
+    INT32_MAX = 2_147_483_647
+    INT32_MIN = -2_147_483_648
+    int32_cols = [
+        'league_id', 'ladder_id', 'rating', 'wins', 'losses', 'ties', 'points',
+        'longest_win_streak', 'current_win_streak', 'current_rank',
+        'highest_rank', 'previous_rank', 'character_id', 'character_realm',
+        'primary_race_count',
+    ]
+    for col in int32_cols:
+        if col in df.columns:
+            df[col] = df[col].where(
+                df[col].isna() | ((df[col] >= INT32_MIN) & (df[col] <= INT32_MAX)),
+                other=pd.NA,
+            )
+
     df['snapshot_ts'] = pd.to_datetime(df['snapshot_ts'])
 
     return df
